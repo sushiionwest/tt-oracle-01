@@ -1,0 +1,5 @@
+.git
+sim_build/
+results.xml
+tb.fst
+__pycache__/
