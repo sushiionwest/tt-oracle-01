@@ -101,7 +101,10 @@ module oracle_top (
     // ---- policy engine ----
     // LOAD mode (mode_load=1) holds the GAME in reset but keeps the policy
     // engine OUT of reset so weight writes land (spec REQ-INTF-003).
-    wire pe_start = latch_feat;
+    // CR-001: gate pe_start off during LOAD — a frame_tick arriving
+    // mid-load would otherwise start a phantom inference that rotates the
+    // weight ring and corrupts the stream being loaded.
+    wire pe_start = latch_feat & ~mode_load;
     policy_engine u_policy (
         .clk,
         .rst(rst & ~mode_load),
