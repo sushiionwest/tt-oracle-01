@@ -49,17 +49,18 @@ module policy_engine (
     wire [1:0]  ld_wo_o  = ld_q16[1:0];
     wire [3:0]  ld_wo_h  = ld_r16[3:0];           // 0..15 by construction
 
-    integer i;
+    integer iw;  // loop var: weight-load block ONLY (never FSM block)
+    integer if_; // loop var: FSM reset block ONLY (never weight-load block)
     always @(posedge clk) begin
         if (rst) begin
-            for (i = 0; i < 16; i = i + 1) begin
-                w_in[i][0] <= 8'sd0; w_in[i][1] <= 8'sd0;
-                w_in[i][2] <= 8'sd0; w_in[i][3] <= 8'sd0;
-                w_in[i][4] <= 8'sd0;
-                b_h[i] <= 8'sd0;
+            for (iw = 0; iw < 16; iw = iw + 1) begin
+                w_in[iw][0] <= 8'sd0; w_in[iw][1] <= 8'sd0;
+                w_in[iw][2] <= 8'sd0; w_in[iw][3] <= 8'sd0;
+                w_in[iw][4] <= 8'sd0;
+                b_h[iw] <= 8'sd0;
             end
-            for (i = 0; i < 3; i = i + 1) begin
-                b_out[i] <= 8'sd0;
+            for (iw = 0; iw < 3; iw = iw + 1) begin
+                b_out[iw] <= 8'sd0;
             end
         end else if (ld_go) begin
             if (load_addr < 8'd80)
@@ -138,8 +139,8 @@ module policy_engine (
             cycles_cnt <= 8'd0;
             acc <= 32'sd0;
             h_idx <= 4'd0; k_idx <= 3'd0; o_idx <= 2'd0; oh_idx <= 5'd0;
-            for (i = 0; i < 16; i = i + 1) hidden[i] <= 8'sd0;
-            for (i = 0; i < 3; i = i + 1) scores[i] <= 8'sd0;
+            for (if_ = 0; if_ < 16; if_ = if_ + 1) hidden[if_] <= 8'sd0;
+            for (if_ = 0; if_ < 3; if_ = if_ + 1) scores[if_] <= 8'sd0;
         end else begin
             done <= 1'b0;
             case (st)
