@@ -101,10 +101,24 @@ module oracle_top (
     // ---- policy engine ----
     // LOAD mode (mode_load=1) holds the GAME in reset but keeps the policy
     // engine OUT of reset so weight writes land (spec REQ-INTF-003).
-    // CR-001: gate pe_start off during LOAD — a frame_tick arriving
+    // CR-001: gate requests off during LOAD — a frame_tick arriving
     // mid-load would otherwise start a phantom inference that rotates the
     // weight ring and corrupts the stream being loaded.
-    wire pe_start = latch_feat & ~mode_load;
+    // CR-001 rev B: the v3 engine rotates unconditionally and therefore
+    // accepts start only on aligned windows (~1 in 147 clocks); a raw
+    // single-cycle latch_feat pulse would usually be missed and leave a
+    // STALE action applied for the whole frame. Hold pe_req until done:
+    // pickup lands within ~147 cycles of the aligned-window cadence plus
+    // 147 inference cycles — far inside the 420,000-clock frame — so the
+    // one-frame action pipeline is preserved. Mirrors the golden-vector
+    // TB's hold-start-until-done protocol.
+    reg pe_req;
+    always @(posedge clk) begin
+        if (rst | mode_load) pe_req <= 1'b0;
+        else if (latch_feat) pe_req <= 1'b1;
+        else if (dbg_done)   pe_req <= 1'b0;
+    end
+    wire pe_start = pe_req & ~mode_load;
     policy_engine u_policy (
         .clk,
         .rst(rst & ~mode_load),

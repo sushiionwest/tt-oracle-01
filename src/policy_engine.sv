@@ -1,27 +1,28 @@
 // ORACLE — CHIP 001
-// policy_engine v2 (CR-001): frozen int8 MLP, 5 u8 features -> 16 ReLU ->
-// 3 sat8 scores -> argmax (ties to lowest index). Semantics normative from
+// policy_engine v3 (CR-001 rev B): frozen int8 MLP, 5 u8 features ->
+// 16 ReLU -> 3 sat8 scores -> argmax (ties lowest). Normative semantics:
 // reference/oracle_model.py. Cycle-exact: 147 cycles per inference.
 //
-// AREA REWRITE (CR-001, 2026-08-22): v1 stored weights in randomly-indexed
-// arrays; variable-index reads synthesized to ~4.5k mux cells (43% of chip
-// combinational logic) and blew the 1x2 tile budget (GPL-0301, 304% util).
-// v2 stores weights in a 147-byte ROTATING RING whose order equals the
-// inference traversal order; w_cur is always the head byte (wring[0]).
-// 147 consumptions per inference = exactly one full revolution, so the
-// ring self-restores between inferences. Same flop count, near-zero read
-// muxing. Hidden activations use the same trick (16-byte ring; 48 OUT
-// reads = 3 revolutions -> self-restoring).
+// AREA REWRITE HISTORY (CR-001):
+//  v1: randomly-indexed weight arrays -> ~4.5k mux cells -> GPL-0301 fail
+//      (304% utilization on a 1x2 tile).
+//  v2: rotating ring, rotate-only-during-inference. Muxes fell to ~3.1k
+//      but still 281% — "rotate vs hold" is itself one mux per flop
+//      (~1176x), plus the ld_cnt write decode.
+//  v3 (THIS): UNCONDITIONAL rotation. The ring turns every clock except
+//      inside an open LOAD session. Therefore:
+//        - zero per-flop hold muxes for rotation
+//        - LOAD writes land at ring[0] (static index). Each accepted byte
+//          rotates once, so after 147 WE-cycles the stream sits aligned
+//          and the phase is self-restored (147 mod 147 == 0)
+//        - inference consumes exactly 147 rotations and self-restores too
+//      Only variable-index write left: hring[hw_ptr] (16-entry decode).
 //
-// Weight stream order == load order (CR-001; supersedes v1 map). Biases
-// are interleaved immediately after their row because the FSM consumes
-// them in that order:
-//   0..95   : for h = 0..15  -> w_in[h][0..4], b_h[h]     (6 bytes/unit)
-//   96..146 : for o = 0..2   -> w_out[o][0..15], b_out[o] (17 bytes/output)
-// Loads must stream ascending 0..146 (all program loaders do). load_addr
-// is retained for pin/interface compatibility but functionally unused.
-// A new LOAD session (rising edge of load_en) resets the stream counter,
-// enabling live weight swaps without global reset.
+// Weight stream order (normative, CR-001): biases interleaved after their
+// row; see reference/oracle_model.py infer() docstring:
+//   idx 0..95  : h=0..15 -> w_in[h][0..4], b_h[h]
+//   idx 96..146: o=0..2  -> w_out[o][0..15], b_out[o]
+// Loads must stream ascending 0..146 with load_we asserted per byte.
 
 `default_nettype none
 
@@ -32,65 +33,91 @@ module policy_engine (
     input  wire        load_en,
     input  wire [7:0]  load_data,
     /* verilator lint_off UNUSEDSIGNAL */
-    input  wire [7:0]  load_addr,   // compat only; unused (CR-001)
+    input  wire [7:0]  load_addr,   // compat only; unused since CR-001
+    /* verilator lint_on UNUSEDSIGNAL */
     input  wire        load_we,
     input  wire [7:0]  f0, f1, f2, f3, f4,
     output reg  [1:0]  action,
     output reg         done,
     output reg  [7:0]  cycles_cnt
 );
-    /* verilator lint_on UNUSEDSIGNAL */
 
     localparam [1:0] IDLE = 2'd0, HIDDEN = 2'd1, OUT = 2'd2, FINISH = 2'd3;
 
-    // ---- FSM state (declared early: consuming depends on st) ----
     reg [1:0] st;
-    /* verilator lint_off UNUSEDSIGNAL */
-    reg [1:0] st_q;     // debug alias of state (sim observability)
-    /* verilator lint_on UNUSEDSIGNAL */
     reg [3:0] h_idx;     // 0..15
     reg [2:0] k_idx;     // 0..5, 5 = bias cycle
     reg [1:0] o_idx;     // 0..2
     reg [4:0] oh_idx;    // 0..16, 16 = bias cycle
     reg signed [31:0] acc;
-
-    wire consuming = (st == HIDDEN) || (st == OUT);
-
-    // ---- weight ring: head = wring[0] ----
-    reg [7:0] wring [0:146];
     /* verilator lint_off UNUSEDSIGNAL */
-    reg [7:0] wring0;   // debug alias of head byte (sim observability)
+    wire consuming = (st == HIDDEN) || (st == OUT);  // v2 leftover, unused
     /* verilator lint_on UNUSEDSIGNAL */
-    reg [7:0] ld_cnt;    // bytes accepted in current LOAD session
-    reg       ld_prev;   // load_en edge detect for session restart
+
+    // ---- weight ring ----
+    // v3b: rotation is unconditional (zero per-flop hold muxes) EXCEPT
+    // during open LOAD sessions and the session-open/close edges.
+    // ALIGNMENT MATH (validated in mirror before RTL): per WE-cycle the
+    // ring rotates once and the incoming byte lands in slot0, so an
+    // ascending 147-byte load leaves the ring as
+    //     [s146, s0, s1, ..., s145]
+    // The FSM rotates on its ACCEPT edge too (rotation is unconditional
+    // outside LOAD), so alignment is declared at align_cnt==0: the accept
+    // rotation lands s0 at the head on the FIRST MAC cycle. The counter
+    // free-runs mod 147 (same period as the ring), so alignment recurs
+    // once per revolution and back-to-back inferences re-arm. Worst wait:
+    // 146 clocks — trivial vs the one-frame action pipeline.
+    reg [7:0] wring [0:146];
+    reg [7:0] ld_cnt;
+    reg       ld_prev;
+    reg [7:0] align_cnt;   // rotations since session close, mod 147
+    wire      aligned = (align_cnt == 8'd0);
 
     integer iw;          // loop var: wring block ONLY
     always @(posedge clk) begin
         if (rst) begin
-            ld_cnt  <= 8'd0;
-            ld_prev <= 1'b0;
+            ld_cnt    <= 8'd0;
+            ld_prev   <= 1'b0;
+            align_cnt <= 8'd0;
             for (iw = 0; iw < 147; iw = iw + 1) wring[iw] <= 8'd0;
         end else begin
-            ld_prev <= load_en;
-            if (load_en && !ld_prev) begin
-                ld_cnt <= 8'd0;              // fresh LOAD session
-            end else if (load_en && load_we && ld_cnt < 8'd147) begin
-                wring[ld_cnt[7:0]] <= load_data;   // static index (unrolled)
-                ld_cnt <= ld_cnt + 8'd1;
-            end else if (consuming) begin
-                // rotate one step toward head; 147 steps = full revolution
-                for (iw = 0; iw < 146; iw = iw + 1)
-                    wring[iw] <= wring[iw+1];
-                wring[146] <= wring[0];
+            ld_prev <= load_en;          // unconditional edge tracking
+            if (load_en != ld_prev) begin
+                // session-open OR session-close edge: hold ring this cycle.
+                if (!load_en) begin
+                    ld_cnt    <= 8'd0;   // closed: arm next session
+                    align_cnt <= 8'd0;   // phase count starts at close
+                end
+            end else begin
+                if (!load_en || load_we) begin
+                    // rotate once per clock outside LOAD, and on each
+                    // accepted LOAD byte (WE-cycles fill consecutive slots)
+                    for (iw = 0; iw < 146; iw = iw + 1)
+                        wring[iw] <= wring[iw+1];
+                    wring[146] <= wring[0];
+                    if (!load_en) begin
+                        // free-runs mod 147 so aligned (cnt==1) recurs once
+                        // per ring revolution -> back-to-back inferences arm
+                        align_cnt <= (align_cnt == 8'd146) ? 8'd0
+                                                           : align_cnt + 8'd1;
+                    end
+                end
+                if (load_en && load_we && ld_cnt < 8'd147) begin
+                    // static-index write; after the rotation so the byte
+                    // lands at slot 0 of this cycle
+                    wring[0] <= load_data;
+                    ld_cnt   <= ld_cnt + 8'd1;
+                end
             end
         end
     end
-    always @(posedge clk) wring0 <= wring[0];
-    always @(posedge clk) st_q <= st;
 
-    // ---- hidden activation ring: head = hring[0] ----
+    // ---- hidden activation ring ----
+    // Writes during HIDDEN bias cycles at hw_ptr; rotates on every OUT
+    // MAC cycle (48 rotations = 3 full revolutions -> self-restores).
+    // Rotation holds during IDLE/HIDDEN/FINISH to keep write timing simple.
     reg [7:0] hring [0:15];
-    reg [3:0] hw_ptr;    // write position during HIDDEN; 16 writes/inference
+    reg [3:0] hw_ptr;
 
     integer ih;          // loop var: hring block ONLY
     always @(posedge clk) begin
@@ -98,20 +125,16 @@ module policy_engine (
             hw_ptr <= 4'd0;
             for (ih = 0; ih < 16; ih = ih + 1) hring[ih] <= 8'd0;
         end else if (st == HIDDEN && k_idx == 3'd5) begin
-            hring[hw_ptr] <= relu_q;     // static index (unrolled)
-            hw_ptr <= hw_ptr + 4'd1;     // wraps to 0 after 16 units
+            hring[hw_ptr] <= relu_q;     // static-ish index (16-entry decode)
+            hw_ptr <= hw_ptr + 4'd1;
         end else if (st == OUT && oh_idx != 5'd16) begin
-            // rotate ONLY on MAC cycles: 48 rotations per inference,
-            // 48 mod 16 == 0 -> ring self-restores. Rotating on bias
-            // cycles too would misalign by 3 per inference (found by
-            // golden-vector run, CR-001).
             for (ih = 0; ih < 15; ih = ih + 1)
                 hring[ih] <= hring[ih+1];
             hring[15] <= hring[0];
         end
     end
 
-    // ---- datapath heads (zero mux cost) ----
+    // ---- datapath heads (zero read-mux cost) ----
     wire signed [7:0] w_head = $signed(wring[0]);
     wire signed [7:0] h_head = $signed(hring[0]);
 
@@ -122,7 +145,6 @@ module policy_engine (
         w_cur = 8'sd0;
         f_cur = 8'sd0;
         if (st == HIDDEN) begin
-            w_cur = w_head;
             case (k_idx)
                 3'd0: f_cur = $signed(f0);
                 3'd1: f_cur = $signed(f1);
@@ -131,13 +153,12 @@ module policy_engine (
                 default: f_cur = $signed(f4);
             endcase
             if (k_idx == 3'd5) begin
-                w_cur = w_head;          // bias byte from stream
                 f_cur = 8'sd1;           // x1 => true bias add (model-exact)
             end
         end else if (st == OUT) begin
-            w_cur = w_head;
             f_cur = (oh_idx == 5'd16) ? 8'sd1 : h_head;
         end
+        w_cur = w_head;
     end
 
     // s8 * s8 -> s16 product, accumulated into s32
@@ -170,7 +191,7 @@ module policy_engine (
         end else begin
             done <= 1'b0;
             case (st)
-                IDLE: if (start) begin
+                IDLE: if (start && aligned) begin
                     st <= HIDDEN;
                     h_idx <= 4'd0; k_idx <= 3'd0;
                     acc <= 32'sd0;
